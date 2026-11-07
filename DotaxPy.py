@@ -4,7 +4,7 @@
 import sys
 import os
 import time
-import glob
+import shutil
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
@@ -25,7 +25,6 @@ import asyncio
 import random
 import subprocess
 import importlib
-import re
 
 
 def ensure(pkg, import_name=None):
@@ -44,7 +43,6 @@ if os.name == "nt":
     os.system("")
 
 import psutil
-import requests
 from playwright.async_api import async_playwright
 
 try:
@@ -331,49 +329,6 @@ def ts():
     return time.strftime("%H:%M:%S")
 
 
-def build_message():
-    e1 = random.choice(EMOJI_LIST_1)
-    num = random.randint(1, 10**10)
-    line = f"{PREFIX} {HARDCODED_MIDDLE} {e1} !!"
-    body = NL_BETWEEN.join([line] * MSG_LINES)
-    return f"{body}{NL_END}{num}"
-
-
-# ================= USERNAME FROM SESSION =================
-def get_username_from_session(session_id):
-    """Use sessionid cookie to fetch Instagram username."""
-    try:
-        headers = {"User-Agent": USER_AGENT}
-        cookies = {"sessionid": session_id}
-        # Instagram endpoint that returns user info for the authenticated user
-        r = requests.get(
-            "https://www.instagram.com/api/v1/accounts/edit/web_form_data/",
-            headers=headers,
-            cookies=cookies,
-            timeout=15,
-        )
-        if r.status_code == 200:
-            data = r.json()
-            username = data.get("form_data", {}).get("username")
-            if username:
-                return username
-        # Fallback endpoint
-        r2 = requests.get(
-            "https://www.instagram.com/api/v1/users/web_profile_info/?username=me",
-            headers=headers,
-            cookies=cookies,
-            timeout=15,
-        )
-        if r2.status_code == 200:
-            data2 = r2.json()
-            username2 = data2.get("data", {}).get("user", {}).get("username")
-            if username2:
-                return username2
-    except Exception as e:
-        print(f"⚠️ username fetch: {type(e).__name__}: {e}")
-    return None
-
-
 def sanitize_name(name):
     safe = "".join(
         c if (c.isascii() and c.isalnum()) or c in "._-"
@@ -383,6 +338,42 @@ def sanitize_name(name):
     if not safe or safe.strip("._-") == "":
         return "user"
     return safe
+
+
+async def safe_rename(src, dst, max_tries=15):
+    for i in range(max_tries):
+        try:
+            os.rename(src, dst)
+            return True
+        except FileExistsError:
+            return False
+        except OSError:
+            if i == max_tries - 1:
+                return False
+            await asyncio.sleep(0.3)
+    return False
+
+
+async def safe_rmtree(path, max_tries=15):
+    if not os.path.isdir(path):
+        return True
+    for i in range(max_tries):
+        try:
+            shutil.rmtree(path)
+            return True
+        except OSError:
+            if i == max_tries - 1:
+                return False
+            await asyncio.sleep(0.3)
+    return False
+
+
+def build_message():
+    e1 = random.choice(EMOJI_LIST_1)
+    num = random.randint(1, 10**10)
+    line = f"{PREFIX} {HARDCODED_MIDDLE} {e1} !!"
+    body = NL_BETWEEN.join([line] * MSG_LINES)
+    return f"{body}{NL_END}{num}"
 
 
 # ================= POPUP / INPUT =================
@@ -432,7 +423,7 @@ async def prompt_async(text):
     return await loop.run_in_executor(None, input, text)
 
 
-# ================= USERNAME EXTRACT (from browser) =================
+# ================= USERNAME EXTRACT =================
 async def extract_username(page):
     try:
         if "instagram.com" not in page.url:
@@ -531,7 +522,6 @@ async def launch_browser_with_profile(pw, profile_dir, session_id):
         launch_kwargs.pop("no_viewport", None)
         context = await pw.chromium.launch_persistent_context(**launch_kwargs)
 
-    # Inject sessionid cookie
     try:
         await context.add_cookies([{
             "name": "sessionid",
@@ -701,7 +691,7 @@ async def gc_monitor(page):
 
     while True:
         try:
-            await asyncio.sleep(REDIRECT_WATCH_INTERVAL)   # 60s
+            await asyncio.sleep(REDIRECT_WATCH_INTERVAL)
 
             if LOGGED_OUT: return
             if not TARGET_URL or TARGET_URL == "?": continue
@@ -924,8 +914,7 @@ async def dashboard():
 
 
 # ================= BROWSER HEALTH MONITOR =================
-async def browser_health_monitor(context, page, session_id, profile_dir, restart_flag):
-    """Watchdog: if browser disconnects, wait 60s then trigger restart."""
+async def browser_health_monitor(context, page, restart_flag):
     disconnected = asyncio.Event()
 
     def on_disconnect(*args):
@@ -938,7 +927,6 @@ async def browser_health_monitor(context, page, session_id, profile_dir, restart
     except Exception:
         pass
 
-    # Periodic check every 60s
     while True:
         try:
             await asyncio.sleep(60)
@@ -957,7 +945,6 @@ async def browser_health_monitor(context, page, session_id, profile_dir, restart
                 if restart_flag.is_set():
                     return
                 print("🔄 Restarting browser...")
-                # Signal main loop to restart
                 restart_flag.set()
                 return
 
@@ -985,11 +972,12 @@ async def main():
     if os.path.isdir(PROFILES_DIR):
         for entry in os.listdir(PROFILES_DIR):
             full = os.path.join(PROFILES_DIR, entry)
-            if os.path.isdir(full) and entry != "__pycache__":
+            if os.path.isdir(full) and not entry.startswith("_"):
                 existing_profiles.append(entry)
 
     session_id = ""
     profile_dir = ""
+    needs_naming = False
 
     if existing_profiles:
         print("\n📁 Existing profiles found:")
@@ -1003,7 +991,6 @@ async def main():
             if 0 <= idx < len(existing_profiles):
                 profile_name = existing_profiles[idx]
                 profile_dir = os.path.join(PROFILES_DIR, profile_name)
-                # Ask for session id for this profile (needed for cookie injection)
                 print(f"👉 Enter session ID for existing profile '{profile_name}':")
                 session_id = (await prompt_async("Session ID: ")).strip()
                 if not session_id:
@@ -1015,6 +1002,7 @@ async def main():
                 if not session_id:
                     print("❌ Session ID required.")
                     return
+                needs_naming = True
         except ValueError:
             print("❌ Invalid choice.")
             return
@@ -1024,25 +1012,83 @@ async def main():
         if not session_id:
             print("❌ Session ID required.")
             return
-
-    # ---------- Fetch username from session ID ----------
-    if not profile_dir:
-        print("🔍 Fetching username from session ID...")
-        uname = get_username_from_session(session_id)
-        if uname:
-            safe = sanitize_name(uname)
-            profile_dir = os.path.join(PROFILES_DIR, safe)
-            print(f"✅ Username: {uname} → profile '{safe}'")
-        else:
-            # fallback: use timestamp
-            fallback = f"user_{int(time.time())}"
-            profile_dir = os.path.join(PROFILES_DIR, fallback)
-            print(f"⚠️ Could not fetch username, using fallback '{fallback}'")
-
-    # Ensure profile dir exists
-    os.makedirs(profile_dir, exist_ok=True)
+        needs_naming = True
 
     pw = await async_playwright().start()
+
+    # ---------- First-time setup: detect username via browser, then rename ----------
+    if needs_naming:
+        temp_name = f"_tmp_{int(time.time())}"
+        temp_dir = os.path.join(PROFILES_DIR, temp_name)
+        os.makedirs(temp_dir, exist_ok=True)
+
+        print("\n🔍 First-time setup: detecting username from session...")
+        temp_context = None
+        uname = None
+        try:
+            temp_context = await launch_browser_with_profile(pw, temp_dir, session_id)
+            temp_page = temp_context.pages[0] if temp_context.pages else await temp_context.new_page()
+            await attach_scripts(temp_page)
+
+            try:
+                await temp_page.goto("https://www.instagram.com/",
+                                     wait_until="domcontentloaded", timeout=30000)
+                await temp_page.wait_for_timeout(3000)
+            except Exception:
+                pass
+
+            try:
+                cur = temp_page.url
+            except Exception:
+                cur = ""
+
+            if "/accounts/login" in cur or "/challenge/" in cur:
+                print(f"❌ Session invalid — landed on {cur[:60]}")
+                try: await temp_context.close()
+                except Exception: pass
+                await asyncio.sleep(1.0)
+                await safe_rmtree(temp_dir)
+                try: await pw.stop()
+                except Exception: pass
+                return
+
+            uname = await extract_username(temp_page)
+        finally:
+            if temp_context:
+                try: await temp_context.close()
+                except Exception: pass
+            await asyncio.sleep(1.0)
+
+        # Fallback if extraction failed — prompt user
+        if not uname:
+            print("⚠️ Username not auto-detected.")
+            try:
+                manual = (await prompt_async("Enter profile folder name (or blank for temp): ")).strip()
+            except Exception:
+                manual = ""
+            if manual:
+                uname = manual
+            else:
+                uname = f"user_{int(time.time())}"
+
+        safe = sanitize_name(uname)
+        final_dir = os.path.join(PROFILES_DIR, safe)
+
+        if os.path.isdir(final_dir):
+            await safe_rmtree(temp_dir)
+            profile_dir = final_dir
+            print(f"✅ Profile '{safe}' already exists — using it")
+        else:
+            if await safe_rename(temp_dir, final_dir):
+                profile_dir = final_dir
+                print(f"✅ Profile saved as '{safe}'")
+            else:
+                profile_dir = temp_dir
+                print(f"⚠️ Rename failed, keeping temp folder")
+
+    os.makedirs(profile_dir, exist_ok=True)
+
+    # ---------- Main launch loop ----------
     context = None
     monitor = None
     dash_task = None
@@ -1052,7 +1098,6 @@ async def main():
 
     try:
         while not restart_flag.is_set():
-            # Launch browser
             try:
                 context = await launch_browser_with_profile(pw, profile_dir, session_id)
                 page = context.pages[0] if context.pages else await context.new_page()
@@ -1062,7 +1107,6 @@ async def main():
                 await asyncio.sleep(60)
                 continue
 
-            # Verify session
             try:
                 await page.goto("https://www.instagram.com/",
                                 wait_until="domcontentloaded", timeout=30000)
@@ -1081,7 +1125,6 @@ async def main():
 
             print(f"✅ Session valid")
 
-            # Username for dashboard
             try:
                 uname = await extract_username(page)
             except Exception:
@@ -1090,7 +1133,7 @@ async def main():
 
             stats["start"] = time.time()
 
-            # Prompts (only once on first launch)
+            # Prompts on first launch
             if not TARGET_URL or TARGET_URL == "?":
                 try:
                     pref = (await prompt_async("Prefix: ")).strip()
@@ -1129,7 +1172,6 @@ async def main():
 
                 TARGET_URL = gc_url
 
-            # Navigate to GC
             try:
                 await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
                 await page.wait_for_timeout(random.randint(3000, 5000))
@@ -1144,49 +1186,37 @@ async def main():
 
             print("✅ GC ready\n")
 
-            # Start tasks
             monitor = asyncio.create_task(gc_monitor(page))
             dash_task = asyncio.create_task(dashboard())
             send_task = asyncio.create_task(send_loop(page))
             health_task = asyncio.create_task(
-                browser_health_monitor(context, page, session_id, profile_dir, restart_flag)
+                browser_health_monitor(context, page, restart_flag)
             )
 
-            # Wait for send/dash to finish OR restart flag
             try:
                 done, pending = await asyncio.wait(
                     [dash_task, send_task, health_task],
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 for t in done:
-                    try:
-                        t.result()
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as e:
-                        print(f"⚠️ Task error: {type(e).__name__}: {e}")
+                    try: t.result()
+                    except asyncio.CancelledError: pass
+                    except Exception as e: print(f"⚠️ Task error: {type(e).__name__}: {e}")
                 for t in pending:
                     t.cancel()
-                    try:
-                        await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                    try: await t
+                    except (asyncio.CancelledError, Exception): pass
             except KeyboardInterrupt:
                 break
 
-            # Cleanup before restart
             for t in (dash_task, send_task, monitor, health_task):
                 if t and not t.done():
                     t.cancel()
-                    try:
-                        await t
-                    except (asyncio.CancelledError, Exception):
-                        pass
+                    try: await t
+                    except (asyncio.CancelledError, Exception): pass
             if context:
-                try:
-                    await context.close()
-                except Exception:
-                    pass
+                try: await context.close()
+                except Exception: pass
                 context = None
 
             if restart_flag.is_set():
@@ -1194,25 +1224,19 @@ async def main():
                 await asyncio.sleep(60)
                 restart_flag.clear()
             else:
-                break  # normal exit
+                break
 
     finally:
         for t in (dash_task, send_task, monitor, health_task):
             if t and not t.done():
                 t.cancel()
-                try:
-                    await t
-                except (asyncio.CancelledError, Exception):
-                    pass
+                try: await t
+                except (asyncio.CancelledError, Exception): pass
         if context:
-            try:
-                await context.close()
-            except Exception:
-                pass
-        try:
-            await pw.stop()
-        except Exception:
-            pass
+            try: await context.close()
+            except Exception: pass
+        try: await pw.stop()
+        except Exception: pass
 
 
 if __name__ == "__main__":
