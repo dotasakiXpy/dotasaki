@@ -38,6 +38,7 @@ def ensure(pkg, import_name=None):
 ensure("playwright")
 ensure("playwright-stealth", "playwright_stealth")
 ensure("psutil")
+ensure("requests")
 
 if os.name == "nt":
     os.system("")
